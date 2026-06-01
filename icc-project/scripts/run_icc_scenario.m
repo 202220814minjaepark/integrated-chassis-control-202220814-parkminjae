@@ -51,6 +51,7 @@ function [result, kpi] = run_icc_scenario(scenarioId, plantModel, varargin)
     drvState   = struct('L', VEH.lf + VEH.lr, 'k_stanley', 1.5, 'v_min', 1.0);
     ctrlState_lat = struct('intError', 0, 'prevError', 0);
     ctrlState_lon = struct('intError', 0, 'prevForce', 0);
+    ctrlState_ver = struct();                                  % [FIX] ctrl_vertical state
 
     %% 로그 사전 할당
     wheels = {'FL','FR','RL','RR'};
@@ -91,11 +92,54 @@ function [result, kpi] = run_icc_scenario(scenarioId, plantModel, varargin)
         % ----- 3. ICC controllers -----
         yawRateRef = calc_ref_yaw_rate(vx_now, delta_driver, VEH);
         if ctrlOn
+            % (a) ctrl_lateral
             [latCmd, ctrlState_lat] = ctrl_lateral(yawRateRef, yawRate_now, beta_now, ...
                                                   vx_now, ctrlState_lat, CTRL, LIM, dt);
-            % CTRL_COORDINATOR — yaw moment → 차동 brake torque
-            verCmd = 1500 * ones(4,1);                                 % passive baseline
-            lonCmd = struct('Fx_total', 0, 'brakeRatio', 0);           % open-loop brake 사용
+
+            % (b) ctrl_longitudinal — [FIX] ABS 활성화
+            if k > 1
+                ctrlState_lon.wheelSlip = [log.tire.FL.slipRatio(k-1);
+                                           log.tire.FR.slipRatio(k-1);
+                                           log.tire.RL.slipRatio(k-1);
+                                           log.tire.RR.slipRatio(k-1)];
+                ax_prev = log.ax(k-1);
+            else
+                ctrlState_lon.wheelSlip = zeros(4,1);
+                ax_prev = 0;
+            end
+            [lonCmd, ctrlState_lon] = ctrl_longitudinal(scenario.vx0, vx_now, ax_prev, ...
+                                                        ctrlState_lon, CTRL, LIM, dt);
+
+            % (c) ctrl_vertical — [FIX2] CDC 활성화, 4 필드 (zs, zs_dot, zu, zu_dot) 모두 제공
+            %   plant_14dof.m L209 주석에 따라 x(8:11), x(12:15) 는 언스프렁(wheel) 좌표.
+            %   스프렁(body) 좌표는 roll/pitch 로부터 각 코너에서 small-angle 근사로 계산.
+            suspState = struct();
+            if isfield(plantState, 'x') && numel(plantState.x) >= 15
+                % 언스프렁 (wheel) 변위/속도 — plant state 에서 직접
+                suspState.zu     = plantState.x(8:11);
+                suspState.zu_dot = plantState.x(12:15);
+
+                % 스프렁 (body) 변위/속도 — roll/pitch + 각 corner 위치로부터 계산
+                %   small-angle: z_sprung_i ≈ y_i · φ - x_i · θ  (+z up, +y left)
+                phi       = plantState.x(4);    % roll angle
+                phi_dot   = plantState.x(5);    % roll rate
+                theta     = plantState.x(6);    % pitch angle
+                theta_dot = plantState.x(7);    % pitch rate
+                lf  = VEH.lf;  lr  = VEH.lr;
+                htf = VEH.track_f / 2;  htr = VEH.track_r / 2;
+                % Corner (xc, yc) from CoG: FL(+lf,+htf), FR(+lf,-htf), RL(-lr,+htr), RR(-lr,-htr)
+                suspState.zs = [ htf*phi - lf*theta;       % FL
+                                -htf*phi - lf*theta;       % FR
+                                 htr*phi + lr*theta;       % RL
+                                -htr*phi + lr*theta];      % RR
+                suspState.zs_dot = [ htf*phi_dot - lf*theta_dot;
+                                    -htf*phi_dot - lf*theta_dot;
+                                     htr*phi_dot + lr*theta_dot;
+                                    -htr*phi_dot + lr*theta_dot];
+            end
+            [verCmd, ctrlState_ver] = ctrl_vertical(suspState, ctrlState_ver, CTRL, dt);
+
+            % (d) ctrl_coordinator
             actAdd = ctrl_coordinator(latCmd, lonCmd, verCmd, vx_now, VEH, CTRL, LIM);
             delta_AFS  = actAdd.steerAngle;
             brakeESC   = actAdd.brakeTorque;                           % 차동 part
